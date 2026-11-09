@@ -74,5 +74,71 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(main(["balance"]), 0)
 
 
+class RankAndWebhookTests(unittest.TestCase):
+    def setUp(self):
+        self.si = SpeedyIndex(api_key="k")
+
+    def test_rank_pagination_and_query(self):
+        pages = [
+            {"code": 0, "items": [{"q": "a"}], "next_cursor": "c1"},
+            {"code": 0, "items": [{"q": "b"}], "next_cursor": None},
+        ]
+        urls = []
+
+        def fake(req, timeout=None):
+            urls.append(req.full_url)
+            return FakeResp(pages.pop(0))
+
+        with mock.patch("urllib.request.urlopen", fake):
+            rows = list(self.si.rank.positions("p1", changed_only=True))
+        self.assertEqual([r["q"] for r in rows], ["a", "b"])
+        self.assertIn("/v2/rank-tracker/projects/p1/positions?changed_only=true", urls[0])
+        self.assertIn("cursor=c1", urls[1])
+
+    def test_rank_create_project_body(self):
+        calls = []
+
+        def fake(req, timeout=None):
+            calls.append(req)
+            return FakeResp({"code": 0, "project": {"id": "x"}})
+
+        with mock.patch("urllib.request.urlopen", fake):
+            self.si.rank.create_project("example.com", [{"location": "New York,New York,United States", "gl": "us"}],
+                                        keywords=["pizza"], ref="r1", depth=30)
+        body = json.loads(calls[0].data)
+        self.assertEqual(body["domain"], "example.com")
+        self.assertEqual(body["keywords"], ["pizza"])
+        self.assertEqual(body["ref"], "r1")
+        self.assertEqual(calls[0].get_method(), "POST")
+
+    def test_http_error_body_is_parsed(self):
+        import io
+        import urllib.error
+
+        def fake(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 410, "Gone", {"Retry-After": "5"},
+                                         io.BytesIO(b'{"code":1,"error":"rows_expired","message":"old"}'))
+
+        with mock.patch("urllib.request.urlopen", fake), self.assertRaises(SpeedyIndexError) as ctx:
+            self.si.rank.check("c1")
+        self.assertEqual(ctx.exception.status, 410)
+        self.assertEqual(ctx.exception.error, "rows_expired")
+        self.assertEqual(ctx.exception.retry_after, 5.0)
+
+    def test_webhook_signature(self):
+        from speedyindex.webhooks import parse_event, sign, verify_signature
+
+        body = b'{"event":"check.finished","event_id":"e1"}'
+        good = sign(body, "whsec_new")
+        old = sign(body, "whsec_old")
+        self.assertTrue(verify_signature(body, good, "whsec_new"))
+        self.assertTrue(verify_signature(body, f"{good}, {old}", "whsec_old"))
+        self.assertFalse(verify_signature(body, good, "whsec_other"))
+        self.assertFalse(verify_signature(body, None, "whsec_new"))
+        self.assertEqual(parse_event(body, good, "whsec_new")["event_id"], "e1")
+        with self.assertRaises(ValueError):
+            parse_event(body, "sha256=00", "whsec_new")
+
+
 if __name__ == "__main__":
     unittest.main()
